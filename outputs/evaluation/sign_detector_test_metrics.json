@@ -1,0 +1,13 @@
+{
+  "weights": "C:\\Users\\Shivi\\Documents\\traffic sign road safety\\models\\traffic_sign_yolo.pt",
+  "split": "test",
+  "imgsz": 960,
+  "n_images": 135,
+  "n_images_with_signs": 102,
+  "n_boxes": 164,
+  "precision": 0.9813929869027683,
+  "recall": 0.9648209032479743,
+  "mAP50": 0.9764255056890058,
+  "mAP50_95": 0.8762124477651483,
+  "evaluated_at": "2026-11-19T16:28:35"
+}

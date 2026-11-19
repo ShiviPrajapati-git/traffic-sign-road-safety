@@ -1,0 +1,4 @@
+true_class_id,true_label,predicted_class_id,predicted_label,count
+24,Road narrows on the right,27,Pedestrians,1
+28,Children crossing,29,Bicycles crossing,1
+11,Right-of-way at next intersection,30,Beware of ice/snow,1

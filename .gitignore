@@ -1,0 +1,35 @@
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Editor and backups
+.vscode/
+*.bak
+
+# Large data (downloaded separately, see README)
+datasets/GTSRB/
+datasets/GTSDB/
+datasets/GTSDB_YOLO/
+datasets/test_videos/
+
+# Generated outputs and uploads (regenerate by running the pipeline)
+outputs/uploads/
+outputs/annotated_videos/
+outputs/predictions/
+*.mp4
+*.avi
+runs/
+
+# Training runs and auto-downloaded weights
+models/sign_detector/
+yolov8*.pt
+models/*.pth
+models/*.pt
+
+# ...but keep the final small models so the repo runs without retraining
+!models/traffic_sign_cnn.pth
+!models/traffic_sign_yolo.pt

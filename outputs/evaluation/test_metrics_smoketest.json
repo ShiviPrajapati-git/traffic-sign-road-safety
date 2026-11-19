@@ -1,0 +1,30 @@
+{
+  "dataset": "GTSRB official test set (Test.csv)",
+  "smoke_test_subset": true,
+  "n_test_images": 500,
+  "n_correct": 497,
+  "test_accuracy": 0.994,
+  "macro_precision": 0.9846899224806202,
+  "macro_recall": 0.9887596899224806,
+  "macro_f1": 0.9849761216240769,
+  "weighted_precision": 0.9953166666666667,
+  "weighted_recall": 0.994,
+  "weighted_f1": 0.9941095287853909,
+  "classes_absent_from_test": [],
+  "checkpoint": "C:\\Users\\Shivi\\Documents\\traffic sign road safety\\models\\traffic_sign_cnn.pth",
+  "checkpoint_epoch": 13,
+  "checkpoint_validation_accuracy": 0.9919847328244275,
+  "normalization_mean": [
+    0.35786760580835064,
+    0.3177283692383749,
+    0.33459817556998933
+  ],
+  "normalization_std": [
+    0.27343560859147503,
+    0.2557711768906256,
+    0.26453662859879795
+  ],
+  "device": "cuda",
+  "inference_seconds": 0.96,
+  "evaluated_at": "2026-11-18T15:34:03"
+}

@@ -1,0 +1,988 @@
+﻿==================== config.py ====================
+"""
+config.py
+Central configuration for the Traffic Sign Recognition and Road Safety Monitor.
+Every other module imports its paths, constants and thresholds from here.
+"""
+import logging
+import random
+from pathlib import Path
+
+import numpy as np
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+DATASETS_DIR = PROJECT_ROOT / "datasets"
+GTSRB_DIR = DATASETS_DIR / "GTSRB"
+GTSDB_DIR = DATASETS_DIR / "GTSDB"
+TEST_VIDEOS_DIR = DATASETS_DIR / "test_videos"
+GTSDB_YOLO_DIR = DATASETS_DIR / "GTSDB_YOLO"   # created by the converter later
+
+MODELS_DIR = PROJECT_ROOT / "models"
+CLASSIFIER_WEIGHTS = MODELS_DIR / "traffic_sign_cnn.pth"
+SIGN_DETECTOR_WEIGHTS = MODELS_DIR / "traffic_sign_yolo.pt"
+OBJECT_DETECTOR_WEIGHTS = "yolov8n.pt"  # pretrained COCO; Ultralytics auto-downloads
+
+OUTPUTS_DIR = PROJECT_ROOT / "outputs"
+ANNOTATED_VIDEOS_DIR = OUTPUTS_DIR / "annotated_videos"
+PREDICTIONS_DIR = OUTPUTS_DIR / "predictions"
+EVALUATION_DIR = OUTPUTS_DIR / "evaluation"
+
+ALL_DIRS = [
+    GTSRB_DIR, GTSDB_DIR, TEST_VIDEOS_DIR, MODELS_DIR,
+    ANNOTATED_VIDEOS_DIR, PREDICTIONS_DIR, EVALUATION_DIR,
+]
+
+# ---------------------------------------------------------------------------
+# Reproducibility / device
+# ---------------------------------------------------------------------------
+SEED = 42
+
+
+def set_seed(seed: int = SEED) -> None:
+    """Seed Python, NumPy and PyTorch for reproducible runs."""
+    random.seed(seed)
+    np.random.seed(seed)
+    try:
+        import torch
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+    except ImportError:
+        pass
+
+
+def get_device() -> str:
+    """Return 'cuda' if a GPU is available, otherwise 'cpu'."""
+    try:
+        import torch
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except ImportError:
+        return "cpu"
+
+
+# ---------------------------------------------------------------------------
+# Traffic sign classifier (GTSRB)
+# ---------------------------------------------------------------------------
+NUM_SIGN_CLASSES = 43
+SIGN_IMG_SIZE = 32                       # CNN input is 32x32 RGB
+SIGN_MEAN = (0.3403, 0.3121, 0.3214)     # placeholder; recompute from the training set in preprocessing.py
+SIGN_STD = (0.2724, 0.2608, 0.2669)      # placeholder; recompute from the training set in preprocessing.py
+BATCH_SIZE = 128
+EPOCHS = 15
+LEARNING_RATE = 1e-3
+VAL_SPLIT = 0.2
+NUM_WORKERS = 0                          # 0 is safest on Windows
+
+# ---------------------------------------------------------------------------
+# Sign detector (GTSDB -> YOLO)
+# ---------------------------------------------------------------------------
+SIGN_DET_CONF = 0.25
+SIGN_DET_IMG_SIZE = 640
+
+# ---------------------------------------------------------------------------
+# General object detector (COCO classes used)
+# ---------------------------------------------------------------------------
+COCO_ROAD_CLASSES = {
+    0: "pedestrian",   # COCO 'person'
+    1: "bicycle",
+    2: "car",
+    3: "motorcycle",
+    5: "bus",
+    7: "truck",
+}
+VEHICLE_CLASS_NAMES = {"car", "bus", "truck", "motorcycle"}
+VULNERABLE_CLASS_NAMES = {"pedestrian", "bicycle"}
+OBJECT_DET_CONF = 0.35
+TRACKER_CONFIG = "bytetrack.yaml"        # bundled with Ultralytics
+TRAJECTORY_LENGTH = 30                   # frames of history kept per track
+
+# ---------------------------------------------------------------------------
+# Risk analysis (all values are in PIXEL units: prototype, uncalibrated)
+# ---------------------------------------------------------------------------
+RISK_CONFIG = {
+    # Proximity is measured as center distance divided by the mean box diagonal,
+    # so it scales with how large the objects appear.
+    "ped_vehicle_proximity_ratio": 1.5,
+    "vehicle_vehicle_proximity_ratio": 0.8,
+    "high_density_count": 10,                # objects in a frame
+    "sign_approach_ratio": 3.0,              # object-to-sign distance / sign box size
+    "persistence_frames": 8,                 # condition must hold this many frames
+    "smoothing_window": 10,                  # frames for temporal smoothing
+    "medium_score": 0.35,
+    "high_score": 0.65,
+    "alert_cooldown_seconds": 3.0,
+}
+
+RISK_LEVELS = ("LOW", "MEDIUM", "HIGH")
+
+# ---------------------------------------------------------------------------
+# Video / app
+# ---------------------------------------------------------------------------
+PROCESS_EVERY_N_FRAMES = 1               # raise to speed up on slow CPUs
+MAX_UPLOAD_MB = 200
+ALLOWED_IMAGE_EXT = {".jpg", ".jpeg", ".png", ".bmp"}
+ALLOWED_VIDEO_EXT = {".mp4", ".avi", ".mov", ".mkv"}
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+def setup_logging(level: int = logging.INFO) -> None:
+    """Configure console logging once. Safe to call repeatedly."""
+    root = logging.getLogger()
+    if root.handlers:
+        return
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+
+def ensure_dirs() -> None:
+    """Create every required directory if it does not exist."""
+    for d in ALL_DIRS:
+        d.mkdir(parents=True, exist_ok=True)
+==================== src\preprocessing.py ====================
+"""
+src/preprocessing.py
+GTSRB data loading, track-aware train/validation split, normalization statistics,
+augmentation and DataLoader construction.
+
+Run a quick self-test from the project root:
+    python src\\preprocessing.py --limit 3000
+Run on the full dataset:
+    python src\\preprocessing.py
+"""
+import sys
+from pathlib import Path
+
+# Make the project root importable when this file is run directly.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import argparse
+import json
+import logging
+
+import numpy as np
+import pandas as pd
+import torch
+from PIL import Image
+from sklearn.model_selection import GroupShuffleSplit
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms
+from tqdm import tqdm
+
+import config
+
+logger = logging.getLogger(__name__)
+
+NORM_STATS_PATH = config.MODELS_DIR / "sign_norm_stats.json"
+REQUIRED_COLUMNS = ["Roi.X1", "Roi.Y1", "Roi.X2", "Roi.Y2", "ClassId", "Path"]
+
+
+# ---------------------------------------------------------------------------
+# CSV reading
+# ---------------------------------------------------------------------------
+def read_label_csv(csv_path) -> pd.DataFrame:
+    """Read Train.csv / Test.csv (tab or comma separated) and validate columns."""
+    csv_path = Path(csv_path)
+    if not csv_path.is_file():
+        raise FileNotFoundError(f"Label file not found: {csv_path}")
+    if csv_path.stat().st_size < 100:
+        raise ValueError(f"{csv_path.name} is only {csv_path.stat().st_size} bytes (empty/truncated).")
+
+    with open(csv_path, encoding="utf-8-sig", errors="replace") as fh:
+        first_line = fh.readline()
+    sep = "\t" if first_line.count("\t") > first_line.count(",") else ","
+
+    df = pd.read_csv(csv_path, sep=sep)
+    df.columns = [c.strip() for c in df.columns]
+    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError(f"{csv_path.name} is missing columns {missing}. Found: {list(df.columns)}")
+
+    df["Path"] = df["Path"].astype(str).str.strip().str.replace("\\", "/", regex=False)
+    df["ClassId"] = df["ClassId"].astype(int)
+    bad = ~df["ClassId"].between(0, config.NUM_SIGN_CLASSES - 1)
+    if bad.any():
+        raise ValueError(f"{int(bad.sum())} rows in {csv_path.name} have ClassId outside 0..{config.NUM_SIGN_CLASSES - 1}")
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Image loading
+# ---------------------------------------------------------------------------
+def crop_and_resize(img: Image.Image, roi, size: int) -> Image.Image:
+    """Crop to the ROI box (inclusive coordinates, clamped to the image) and resize."""
+    if roi is not None:
+        w, h = img.size
+        x1, y1, x2, y2 = (int(v) for v in roi)
+        x1 = max(0, min(x1, w - 1))
+        y1 = max(0, min(y1, h - 1))
+        x2 = max(x1 + 1, min(x2 + 1, w))
+        y2 = max(y1 + 1, min(y2 + 1, h))
+        img = img.crop((x1, y1, x2, y2))
+    return img.resize((size, size), Image.Resampling.BILINEAR)
+
+
+def load_images(df: pd.DataFrame, root: Path, img_size: int, use_roi: bool, desc: str):
+    """Load, crop and resize every image in df. Unreadable files are skipped and logged.
+
+    Returns (images uint8 array of shape N,H,W,3, filtered dataframe).
+    """
+    records = df.to_dict("records")
+    images, keep, skipped = [], [], 0
+    for i, rec in enumerate(tqdm(records, desc=desc, unit="img")):
+        path = root / rec["Path"]
+        try:
+            with Image.open(path) as im:
+                im = im.convert("RGB")
+                roi = (rec["Roi.X1"], rec["Roi.Y1"], rec["Roi.X2"], rec["Roi.Y2"]) if use_roi else None
+                arr = np.asarray(crop_and_resize(im, roi, img_size), dtype=np.uint8)
+        except Exception as exc:  # noqa: BLE001
+            skipped += 1
+            logger.warning("Skipping unreadable image %s (%s)", path, exc)
+            continue
+        images.append(arr)
+        keep.append(i)
+    if skipped:
+        logger.warning("%d images were skipped in '%s'", skipped, desc)
+    if not images:
+        raise RuntimeError(f"No images could be loaded for '{desc}'. Check the dataset path: {root}")
+    return np.stack(images), df.iloc[keep].reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# Normalization statistics
+# ---------------------------------------------------------------------------
+def compute_mean_std(images: np.ndarray, chunk: int = 4096):
+    """Per-channel mean/std over uint8 images (N,H,W,3), scaled to 0..1."""
+    n_pixels = images.shape[0] * images.shape[1] * images.shape[2]
+    s = np.zeros(3, dtype=np.float64)
+    sq = np.zeros(3, dtype=np.float64)
+    for i in range(0, len(images), chunk):
+        x = images[i:i + chunk].astype(np.float64) / 255.0
+        s += x.sum(axis=(0, 1, 2))
+        sq += (x ** 2).sum(axis=(0, 1, 2))
+    mean = s / n_pixels
+    std = np.sqrt(np.maximum(sq / n_pixels - mean ** 2, 1e-12))
+    return tuple(float(m) for m in mean), tuple(float(v) for v in std)
+
+
+def save_norm_stats(mean, std, path: Path = NORM_STATS_PATH) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"mean": list(mean), "std": list(std)}, indent=2), encoding="utf-8")
+
+
+def load_norm_stats(path: Path = NORM_STATS_PATH):
+    """Return (mean, std) from the saved JSON, or the config placeholders with a warning."""
+    if path.is_file():
+        d = json.loads(path.read_text(encoding="utf-8"))
+        return tuple(d["mean"]), tuple(d["std"])
+    logger.warning("%s not found; using placeholder mean/std from config.py", path)
+    return config.SIGN_MEAN, config.SIGN_STD
+
+
+# ---------------------------------------------------------------------------
+# Transforms and Dataset
+# ---------------------------------------------------------------------------
+def get_transforms(mean, std, train: bool):
+    """Train: mild geometric/color augmentation (NO horizontal flip). Eval: normalize only."""
+    steps = [transforms.ToPILImage()]
+    if train:
+        steps += [
+            transforms.RandomAffine(degrees=10, translate=(0.1, 0.1), scale=(0.9, 1.1)),
+            transforms.ColorJitter(brightness=0.3, contrast=0.3),
+        ]
+    steps += [transforms.ToTensor(), transforms.Normalize(mean, std)]
+    return transforms.Compose(steps)
+
+
+class GTSRBDataset(Dataset):
+    """In-memory dataset of preprocessed uint8 images (N,H,W,3) and integer labels."""
+
+    def __init__(self, images: np.ndarray, labels: np.ndarray, transform=None):
+        assert len(images) == len(labels), "images and labels must have the same length"
+        self.images = images
+        self.labels = labels
+        self.transform = transform
+
+    def __len__(self) -> int:
+        return len(self.images)
+
+    def __getitem__(self, idx: int):
+        img = self.images[idx]
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, int(self.labels[idx])
+
+
+# ---------------------------------------------------------------------------
+# Splitting and DataLoaders
+# ---------------------------------------------------------------------------
+def split_by_track(df: pd.DataFrame, val_split: float = config.VAL_SPLIT, seed: int = config.SEED):
+    """Split so that all frames of one physical sign (same class_track prefix) stay together."""
+    stems = df["Path"].map(lambda p: Path(p).stem)
+    groups = stems.map(lambda s: "_".join(s.split("_")[:2]))
+    splitter = GroupShuffleSplit(n_splits=1, test_size=val_split, random_state=seed)
+    train_idx, val_idx = next(splitter.split(df, df["ClassId"], groups))
+    return train_idx, val_idx, int(groups.nunique())
+
+
+def build_dataloaders(batch_size: int = config.BATCH_SIZE, limit=None, use_roi: bool = True):
+    """Load GTSRB training data, split it by track, and return (train_loader, val_loader, info)."""
+    config.set_seed()
+    df = read_label_csv(config.GTSRB_DIR / "Train.csv")
+    if limit:
+        df = df.sample(n=min(int(limit), len(df)), random_state=config.SEED).reset_index(drop=True)
+        logger.info("Using a random subset of %d training rows (smoke test)", len(df))
+
+    images, df = load_images(df, config.GTSRB_DIR, config.SIGN_IMG_SIZE, use_roi, "Loading train images")
+    labels = df["ClassId"].to_numpy(dtype=np.int64)
+
+    train_idx, val_idx, n_tracks = split_by_track(df)
+    mean, std = compute_mean_std(images[train_idx])
+    save_norm_stats(mean, std)
+
+    train_ds = GTSRBDataset(images[train_idx], labels[train_idx], get_transforms(mean, std, train=True))
+    val_ds = GTSRBDataset(images[val_idx], labels[val_idx], get_transforms(mean, std, train=False))
+
+    pin = config.get_device() == "cuda"
+    gen = torch.Generator().manual_seed(config.SEED)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, generator=gen,
+                              num_workers=config.NUM_WORKERS, pin_memory=pin)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
+                            num_workers=config.NUM_WORKERS, pin_memory=pin)
+
+    val_classes = set(labels[val_idx].tolist())
+    info = {
+        "train_size": len(train_ds),
+        "val_size": len(val_ds),
+        "n_tracks": n_tracks,
+        "mean": mean,
+        "std": std,
+        "train_class_counts": np.bincount(labels[train_idx], minlength=config.NUM_SIGN_CLASSES).tolist(),
+        "classes_missing_from_val": sorted(set(range(config.NUM_SIGN_CLASSES)) - val_classes),
+    }
+    return train_loader, val_loader, info
+
+
+def build_test_loader(mean, std, batch_size: int = config.BATCH_SIZE, limit=None, use_roi: bool = True):
+    """Official GTSRB test set (used only for final evaluation in evaluate.py)."""
+    df = read_label_csv(config.GTSRB_DIR / "Test.csv")
+    if limit:
+        df = df.sample(n=min(int(limit), len(df)), random_state=config.SEED).reset_index(drop=True)
+    images, df = load_images(df, config.GTSRB_DIR, config.SIGN_IMG_SIZE, use_roi, "Loading test images")
+    labels = df["ClassId"].to_numpy(dtype=np.int64)
+    ds = GTSRBDataset(images, labels, get_transforms(mean, std, train=False))
+    return DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=config.NUM_WORKERS,
+                      pin_memory=config.get_device() == "cuda")
+
+
+# ---------------------------------------------------------------------------
+# Self-test
+# ---------------------------------------------------------------------------
+def _save_sample_grid(loader, mean, std, out_path: Path, n: int = 16) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    x, y = next(iter(loader))
+    m = torch.tensor(mean).view(1, 3, 1, 1)
+    s = torch.tensor(std).view(1, 3, 1, 1)
+    x = (x * s + m).clamp(0, 1)[:n]
+    fig, axes = plt.subplots(2, 8, figsize=(12, 3.4))
+    for ax, img, lab in zip(axes.ravel(), x, y[:n]):
+        ax.imshow(img.permute(1, 2, 0).numpy())
+        ax.set_title(f"class {int(lab)}", fontsize=8)
+        ax.axis("off")
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=100)
+    plt.close(fig)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="GTSRB preprocessing self-test")
+    parser.add_argument("--limit", type=int, default=None, help="use only N random training rows (quick test)")
+    args = parser.parse_args()
+
+    config.setup_logging()
+    config.ensure_dirs()
+    try:
+        train_loader, val_loader, info = build_dataloaders(limit=args.limit)
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
+        print(f"\n[ERROR] {exc}")
+        return 1
+
+    print("\n=== PREPROCESSING SELF-TEST ===")
+    print(f"train images      : {info['train_size']:,}")
+    print(f"validation images : {info['val_size']:,}")
+    print(f"distinct tracks   : {info['n_tracks']:,}")
+    print(f"mean (R,G,B)      : {tuple(round(v, 4) for v in info['mean'])}")
+    print(f"std  (R,G,B)      : {tuple(round(v, 4) for v in info['std'])}")
+    if info["classes_missing_from_val"]:
+        print(f"[WARN] classes with no validation samples: {info['classes_missing_from_val']}")
+
+    x, y = next(iter(train_loader))
+    print(f"one batch         : images {tuple(x.shape)}, labels {tuple(y.shape)}, "
+          f"label range {int(y.min())}..{int(y.max())}")
+    grid = config.EVALUATION_DIR / "sample_batch.png"
+    _save_sample_grid(train_loader, info["mean"], info["std"], grid)
+    print(f"sample image grid : {grid}")
+    print(f"normalization stats saved to: {NORM_STATS_PATH}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+==================== src\traffic_sign_classifier.py ====================
+"""
+src/traffic_sign_classifier.py
+CNN architecture, checkpoint helpers, class names, and an inference wrapper that the
+rest of the project (sign detector, video processor, dashboard) will use.
+
+Smoke test (no training needed):
+    python src\\traffic_sign_classifier.py
+"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import logging
+
+import numpy as np
+import torch
+import torch.nn as nn
+from PIL import Image
+from torchvision import transforms
+
+import config
+
+logger = logging.getLogger(__name__)
+
+SIGN_CLASS_NAMES = [
+    "Speed limit (20km/h)", "Speed limit (30km/h)", "Speed limit (50km/h)",
+    "Speed limit (60km/h)", "Speed limit (70km/h)", "Speed limit (80km/h)",
+    "End of speed limit (80km/h)", "Speed limit (100km/h)", "Speed limit (120km/h)",
+    "No passing", "No passing for vehicles over 3.5 tons",
+    "Right-of-way at next intersection", "Priority road", "Yield", "Stop",
+    "No vehicles", "Vehicles over 3.5 tons prohibited", "No entry", "General caution",
+    "Dangerous curve to the left", "Dangerous curve to the right", "Double curve",
+    "Bumpy road", "Slippery road", "Road narrows on the right", "Road work",
+    "Traffic signals", "Pedestrians", "Children crossing", "Bicycles crossing",
+    "Beware of ice/snow", "Wild animals crossing", "End of all speed and passing limits",
+    "Turn right ahead", "Turn left ahead", "Ahead only", "Go straight or right",
+    "Go straight or left", "Keep right", "Keep left", "Roundabout mandatory",
+    "End of no passing", "End of no passing by vehicles over 3.5 tons",
+]
+assert len(SIGN_CLASS_NAMES) == config.NUM_SIGN_CLASSES
+
+
+def _conv_block(in_ch: int, out_ch: int) -> nn.Sequential:
+    return nn.Sequential(
+        nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
+        nn.BatchNorm2d(out_ch),
+        nn.ReLU(inplace=True),
+    )
+
+
+class TrafficSignCNN(nn.Module):
+    """Small VGG-style CNN for 32x32 RGB traffic sign images (about 0.7M parameters)."""
+
+    def __init__(self, num_classes: int = config.NUM_SIGN_CLASSES, dropout: float = 0.4):
+        super().__init__()
+        self.features = nn.Sequential(
+            _conv_block(3, 32), _conv_block(32, 32), nn.MaxPool2d(2), nn.Dropout(0.1),      # 32 -> 16
+            _conv_block(32, 64), _conv_block(64, 64), nn.MaxPool2d(2), nn.Dropout(0.2),     # 16 -> 8
+            _conv_block(64, 128), _conv_block(128, 128), nn.MaxPool2d(2), nn.Dropout(0.3),   # 8 -> 4
+        )
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(128 * 4 * 4, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(256, num_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.classifier(self.features(x))
+
+
+# ---------------------------------------------------------------------------
+# Checkpoints
+# ---------------------------------------------------------------------------
+def save_checkpoint(model: nn.Module, path, mean, std, meta: dict) -> None:
+    """Save weights plus everything needed to reproduce preprocessing at inference time."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({
+        "model_state_dict": model.state_dict(),
+        "num_classes": config.NUM_SIGN_CLASSES,
+        "img_size": config.SIGN_IMG_SIZE,
+        "mean": [float(v) for v in mean],
+        "std": [float(v) for v in std],
+        "meta": meta,
+    }, path)
+
+
+def load_checkpoint(path, device: str = "cpu"):
+    """Return (model in eval mode, checkpoint dict). Raises FileNotFoundError with guidance."""
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Classifier weights not found: {path}\n"
+            "Train the model first:  python src\\train_classifier.py"
+        )
+    ckpt = torch.load(path, map_location=device)
+    model = TrafficSignCNN(num_classes=ckpt["num_classes"]).to(device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+    return model, ckpt
+
+
+# ---------------------------------------------------------------------------
+# Inference wrapper
+# ---------------------------------------------------------------------------
+class TrafficSignClassifier:
+    """Classify cropped sign images. Accepts BGR numpy arrays (OpenCV) or PIL images."""
+
+    def __init__(self, weights_path=config.CLASSIFIER_WEIGHTS, device: str = None):
+        self.device = device or config.get_device()
+        self.model, ckpt = load_checkpoint(weights_path, self.device)
+        self.img_size = ckpt["img_size"]
+        self.meta = ckpt.get("meta", {})
+        self._tf = transforms.Compose([transforms.ToTensor(),
+                                       transforms.Normalize(ckpt["mean"], ckpt["std"])])
+        logger.info("Loaded sign classifier from %s on %s", weights_path, self.device)
+
+    def _to_pil(self, image):
+        if image is None:
+            return None
+        if isinstance(image, Image.Image):
+            return image.convert("RGB")
+        arr = np.asarray(image)
+        if arr.ndim == 2:
+            arr = np.stack([arr] * 3, axis=-1)
+        if arr.ndim != 3 or arr.shape[0] < 2 or arr.shape[1] < 2:
+            return None
+        return Image.fromarray(np.ascontiguousarray(arr[:, :, :3][:, :, ::-1]))  # BGR -> RGB
+
+    @torch.no_grad()
+    def predict_batch(self, images):
+        """Return a list (same length as images) of dicts, or None for invalid crops."""
+        pil = [self._to_pil(im) for im in images]
+        valid = [i for i, p in enumerate(pil) if p is not None]
+        results = [None] * len(pil)
+        if not valid:
+            return results
+        batch = torch.stack([
+            self._tf(pil[i].resize((self.img_size, self.img_size), Image.Resampling.BILINEAR))
+            for i in valid
+        ]).to(self.device)
+        probs = torch.softmax(self.model(batch), dim=1).cpu()
+        conf, cls = probs.max(dim=1)
+        for k, i in enumerate(valid):
+            cid = int(cls[k])
+            results[i] = {"class_id": cid, "label": SIGN_CLASS_NAMES[cid], "confidence": float(conf[k])}
+        return results
+
+    def predict(self, image):
+        return self.predict_batch([image])[0]
+
+
+# ---------------------------------------------------------------------------
+# Smoke test
+# ---------------------------------------------------------------------------
+def main() -> int:
+    config.setup_logging()
+    model = TrafficSignCNN()
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"TrafficSignCNN parameters: {n_params:,}")
+    out = model(torch.randn(2, 3, config.SIGN_IMG_SIZE, config.SIGN_IMG_SIZE))
+    print(f"forward pass OK: output shape {tuple(out.shape)} (expected (2, {config.NUM_SIGN_CLASSES}))")
+    print(f"class names: {len(SIGN_CLASS_NAMES)}; class 14 = '{SIGN_CLASS_NAMES[14]}'")
+    print(f"trained weights present: {config.CLASSIFIER_WEIGHTS.is_file()} ({config.CLASSIFIER_WEIGHTS})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+==================== src\train_classifier.py ====================
+"""
+src/train_classifier.py
+Train the GTSRB CNN, keep the best checkpoint by validation accuracy, and save the
+training history, curves and a summary to outputs\\evaluation.
+
+Quick pipeline test (does not touch the real weights file):
+    python src\\train_classifier.py --epochs 1 --limit 3000
+Full training:
+    python src\\train_classifier.py
+"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import argparse
+import json
+import logging
+import time
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import pandas as pd
+import torch
+import torch.nn as nn
+from tqdm import tqdm
+
+import config
+from src.preprocessing import build_dataloaders
+from src.traffic_sign_classifier import TrafficSignCNN, save_checkpoint
+
+logger = logging.getLogger(__name__)
+
+
+def run_epoch(model, loader, criterion, device, optimizer=None, desc=""):
+    """One pass over loader. Trains if an optimizer is given, otherwise evaluates."""
+    training = optimizer is not None
+    model.train(training)
+    total_loss, correct, count = 0.0, 0, 0
+    with torch.set_grad_enabled(training):
+        for x, y in tqdm(loader, desc=desc, unit="batch", leave=False):
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            logits = model(x)
+            loss = criterion(logits, y)
+            if training:
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                optimizer.step()
+            total_loss += loss.item() * y.size(0)
+            correct += (logits.argmax(dim=1) == y).sum().item()
+            count += y.size(0)
+    return total_loss / count, correct / count
+
+
+def plot_history(history: pd.DataFrame, out_path: Path) -> None:
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+    axes[0].plot(history["epoch"], history["train_loss"], label="train")
+    axes[0].plot(history["epoch"], history["val_loss"], label="validation")
+    axes[0].set_title("Loss"); axes[0].set_xlabel("epoch"); axes[0].legend()
+    axes[1].plot(history["epoch"], history["train_acc"], label="train")
+    axes[1].plot(history["epoch"], history["val_acc"], label="validation")
+    axes[1].set_title("Accuracy"); axes[1].set_xlabel("epoch"); axes[1].legend()
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Train the GTSRB traffic sign CNN")
+    parser.add_argument("--epochs", type=int, default=config.EPOCHS)
+    parser.add_argument("--batch-size", type=int, default=config.BATCH_SIZE)
+    parser.add_argument("--lr", type=float, default=config.LEARNING_RATE)
+    parser.add_argument("--patience", type=int, default=5, help="early-stopping patience (epochs)")
+    parser.add_argument("--limit", type=int, default=None, help="use only N random rows (quick test)")
+    args = parser.parse_args()
+
+    config.setup_logging()
+    config.ensure_dirs()
+    config.set_seed()
+    device = config.get_device()
+    print(f"Device: {device}")
+    if device == "cuda":
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+
+    try:
+        train_loader, val_loader, info = build_dataloaders(batch_size=args.batch_size, limit=args.limit)
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
+        print(f"\n[ERROR] {exc}")
+        return 1
+    print(f"Train: {info['train_size']:,} images | Validation: {info['val_size']:,} images "
+          f"(split by sign track, seed {config.SEED})")
+
+    model = TrafficSignCNN().to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=2)
+
+    weights_path = config.CLASSIFIER_WEIGHTS
+    if args.limit:  # smoke test must never overwrite the real model
+        weights_path = config.MODELS_DIR / "traffic_sign_cnn_smoketest.pth"
+        print(f"--limit given: checkpoint will be saved to {weights_path.name}, not the real weights file")
+
+    history, best_acc, best_epoch, bad_epochs = [], -1.0, 0, 0
+    start = time.time()
+    for epoch in range(1, args.epochs + 1):
+        t0 = time.time()
+        tr_loss, tr_acc = run_epoch(model, train_loader, criterion, device, optimizer, f"Epoch {epoch} train")
+        va_loss, va_acc = run_epoch(model, val_loader, criterion, device, None, f"Epoch {epoch} val")
+        scheduler.step(va_acc)
+        history.append({"epoch": epoch, "train_loss": tr_loss, "train_acc": tr_acc,
+                        "val_loss": va_loss, "val_acc": va_acc, "lr": optimizer.param_groups[0]["lr"]})
+        print(f"Epoch {epoch:>2}/{args.epochs} | train loss {tr_loss:.4f} acc {tr_acc:.4f} | "
+              f"val loss {va_loss:.4f} acc {va_acc:.4f} | {time.time() - t0:.1f}s")
+
+        if va_acc > best_acc:
+            best_acc, best_epoch, bad_epochs = va_acc, epoch, 0
+            save_checkpoint(model, weights_path, info["mean"], info["std"], {
+                "epoch": epoch, "val_acc": va_acc, "val_loss": va_loss, "seed": config.SEED,
+                "train_size": info["train_size"], "val_size": info["val_size"],
+                "split": "grouped by sign track",
+            })
+        else:
+            bad_epochs += 1
+            if bad_epochs >= args.patience:
+                print(f"Early stopping: no validation improvement for {args.patience} epochs.")
+                break
+
+    hist_df = pd.DataFrame(history)
+    hist_df.to_csv(config.EVALUATION_DIR / "training_history.csv", index=False)
+    plot_history(hist_df, config.EVALUATION_DIR / "training_curves.png")
+    summary = {
+        "best_val_acc": best_acc, "best_epoch": best_epoch, "epochs_run": len(history),
+        "train_size": info["train_size"], "val_size": info["val_size"], "device": device,
+        "total_seconds": round(time.time() - start, 1), "weights_file": str(weights_path),
+        "smoke_test": bool(args.limit),
+    }
+    (config.EVALUATION_DIR / "training_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    print(f"\nBest validation accuracy: {best_acc:.4f} (epoch {best_epoch})")
+    print(f"Weights saved to: {weights_path}")
+    print(f"History, curves and summary saved in: {config.EVALUATION_DIR}")
+    print("Note: this is validation accuracy on held-out tracks from the training set. "
+          "Final test metrics come from evaluate.py on the official test set.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+==================== FILE LISTING ====================
+
+FullName                                                                      
+--------                                                                      
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector        
+C:\Users\Shivi\Documents\traffic sign road safety\models\gtsdb_sign_detecto...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_norm_stats.json 
+C:\Users\Shivi\Documents\traffic sign road safety\models\traffic_sign_cnn.pth 
+C:\Users\Shivi\Documents\traffic sign road safety\models\traffic_sign_cnn_s...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\gtsd...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\gtsd...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\test...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\gtsd...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\gtsd...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\gtsd...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\gtsd...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\gtsd...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\gtsd...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\gtsd...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\gtsd...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\gtsd...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\gtsd...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\gtsd...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\gtsd...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\gtsd...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\gtsd...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\gtsd...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\gtsd...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\gtsd...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\gtsd...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\gtsd...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\gtsd...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\gtsd...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\gtsd...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\gtsd...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\gtsd...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\gtsd...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\gtsd...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\gtsd...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\gtsd...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\gtsd...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\gtsd...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\gtsd...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\test...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\test...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\test...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\test...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\test...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\test...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\test...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\test...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\test...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\test...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\test...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\test...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\test...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\test...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\test...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\test...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\test...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\test...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\test...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\test...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\test...
+C:\Users\Shivi\Documents\traffic sign road safety\models\sign_detector\test...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\annotated_videos    
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\evaluation          
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions         
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\evaluation\gtsdb_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\evaluation\gtsrb_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\evaluation\sample...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\evaluation\test_c...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\evaluation\test_c...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\evaluation\test_c...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\evaluation\test_c...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\evaluation\test_c...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\evaluation\test_c...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\evaluation\test_m...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\evaluation\test_m...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\evaluation\test_t...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\evaluation\test_t...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\evaluation\traini...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\evaluation\traini...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\evaluation\traini...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+C:\Users\Shivi\Documents\traffic sign road safety\outputs\predictions\sign_...
+
+

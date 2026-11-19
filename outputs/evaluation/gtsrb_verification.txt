@@ -1,0 +1,59 @@
+Checking: C:\Users\Shivi\Documents\traffic sign road safety\datasets\GTSRB
+Dataset root: C:\Users\Shivi\Documents\traffic sign road safety\datasets\GTSRB
+Contents of root: ['Meta', 'Meta.csv', 'Test', 'Test.csv', 'Train', 'Train.csv']
+
+=== TRAIN IMAGES ===
+  class folders: 43 (expected 43)
+  total train images: 39,209 (expected 39,209)
+  smallest class: 0 (210 images) | largest: 2 (2250 images)
+  zero-byte images: 0 | unreadable images: 0
+
+=== TEST IMAGES ===
+  total test images: 12,630 (expected 12,630)
+  non-image files in Test (ignored, not a problem): [('GT-final_test.csv', 0)]
+  zero-byte images: 0 | unreadable images: 0
+
+=== CSV FILES ===
+
+--- Train.csv ---
+  size: 1,980,106 bytes
+  delimiter detected: TAB
+  columns (8): ['Width', 'Height', 'Roi.X1', 'Roi.Y1', 'Roi.X2', 'Roi.Y2', 'ClassId', 'Path']
+  data rows: 39,209
+  first rows:
+    ['27', '26', '5', '5', '22', '20', '20', 'Train/20/00020_00000_00000.png']
+    ['28', '27', '5', '6', '23', '22', '20', 'Train/20/00020_00000_00001.png']
+    ['29', '26', '6', '5', '24', '21', '20', 'Train/20/00020_00000_00002.png']
+  path column: 'Path' | rows whose image file is missing: 0
+  ClassId values outside 0..42 or unreadable: 0
+  rows where ClassId differs from the class folder in Path: 0
+
+--- Test.csv ---
+  size: 440,528 bytes
+  delimiter detected: TAB
+  columns (8): ['Width', 'Height', 'Roi.X1', 'Roi.Y1', 'Roi.X2', 'Roi.Y2', 'ClassId', 'Path']
+  data rows: 12,630
+  first rows:
+    ['53', '54', '6', '5', '48', '49', '16', 'Test/00000.png']
+    ['42', '45', '5', '5', '36', '40', '1', 'Test/00001.png']
+    ['48', '52', '6', '6', '43', '47', '38', 'Test/00002.png']
+  path column: 'Path' | rows whose image file is missing: 0
+  ClassId values outside 0..42 or unreadable: 0
+
+--- Meta.csv ---
+  size: 1,077 bytes
+  delimiter detected: TAB
+  columns (5): ['Path', 'ClassId', 'ShapeId', 'ColorId', 'SignId']
+  data rows: 43
+  first rows:
+    ['Meta/27.png', '27', '0', '0', '1.32']
+    ['Meta/0.png', '0', '1', '0', '3.29']
+    ['Meta/1.png', '1', '1', '0', '3.29']
+  path column: 'Path' | rows whose image file is missing: 0
+  ClassId values outside 0..42 or unreadable: 0
+
+=== META FOLDER ===
+  files: 43
+
+=== SUMMARY ===
+RESULT: ALL CHECKS PASSED
