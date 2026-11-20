@@ -51,7 +51,7 @@ Weakest classes: Bumpy road (recall 0.783), Double curve (0.844). Most frequent 
 
 ### Sign detector (GTSDB, YOLOv8n, 960 px, single class)
 
-The 765 usable images were split sequentially by file index: train 00000-00629 (630), validation 00630-00764 (135), test 00765-00899 (135). The checkpoint was chosen on validation only; the test split was scored once.
+The 900 GTSDB images (file index 00000-00899) were split sequentially by file index: train 00000-00629 (630), validation 00630-00764 (135), test 00765-00899 (135). The checkpoint was chosen on validation only; the test split was scored once.
 
 | Split | Images / boxes | Precision | Recall | mAP50 | mAP50-95 |
 |---|---|---|---|---|---|
@@ -110,15 +110,17 @@ Tested with Python 3.13.1, torch 2.15.0 (CUDA), Ultralytics 8.4.215.
 
 ## Data
 
-Datasets are not included. Download them and place them as follows (verify):
+## Data
 
-- **GTSRB** in `datasets\GTSRB\` with `Train\`, `Test\` and `Test.csv`.
-- **GTSDB** in `datasets\GTSDB\`, then convert to YOLO format (this also creates the train/val/test split and `dataset.yaml`):
+Datasets are not included in the repository. Download them and place them like this:
+
+- **GTSRB** (classification): `datasets\GTSRB\` containing `Train\`, `Test\`, `Meta\`, `Train.csv`, `Test.csv` and `Meta.csv`.
+- **GTSDB** (detection): `datasets\GTSDB\FullIJCNN2013\` (the full GTSDB package with the images and the annotation file). Then convert it to YOLO format; this also creates the train/val/test split and `dataset.yaml`:
   ```powershell
   python src\prepare_gtsdb.py
   python src\verify_gtsdb_yolo.py
   ```
-- Test videos go in `datasets\test_videos\` (any short road video in mp4/avi/mov/mkv).
+- **Test videos:** any short road video (mp4/avi/mov/mkv) in `datasets\test_videos\`.
 
 The pretrained `yolov8n.pt` COCO weights download automatically on first use.
 
